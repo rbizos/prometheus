@@ -488,7 +488,8 @@ type GlobalConfig struct {
 	// The protocols to negotiate during a scrape. It tells clients what
 	// protocol are accepted by Prometheus and with what weight (most wanted is first).
 	// Supported values (case sensitive): PrometheusProto, OpenMetricsText0.0.1,
-	// OpenMetricsText1.0.0, PrometheusText1.0.0, PrometheusText0.0.4
+	// OpenMetricsText1.0.0, PrometheusText1.0.0, PrometheusText0.0.4.
+	// OpenMetricsText2.0.0 is also supported but requires --enable-feature=openmetrics-2-0 (experimental implementation).
 	ScrapeProtocols []ScrapeProtocol `yaml:"scrape_protocols,omitempty"`
 	// How frequently to evaluate rules by default.
 	EvaluationInterval model.Duration `yaml:"evaluation_interval,omitempty"`
@@ -571,11 +572,15 @@ func (s ScrapeProtocol) HeaderMediaType() string {
 }
 
 var (
-	PrometheusProto      ScrapeProtocol = "PrometheusProto"
-	PrometheusText0_0_4  ScrapeProtocol = "PrometheusText0.0.4"
-	PrometheusText1_0_0  ScrapeProtocol = "PrometheusText1.0.0"
-	OpenMetricsText0_0_1 ScrapeProtocol = "OpenMetricsText0.0.1"
-	OpenMetricsText1_0_0 ScrapeProtocol = "OpenMetricsText1.0.0"
+	PrometheusProto       ScrapeProtocol = "PrometheusProto"
+	PrometheusText0_0_4   ScrapeProtocol = "PrometheusText0.0.4"
+	PrometheusText1_0_0   ScrapeProtocol = "PrometheusText1.0.0"
+	OpenMetricsText0_0_1  ScrapeProtocol = "OpenMetricsText0.0.1"
+	OpenMetricsText1_0_0  ScrapeProtocol = "OpenMetricsText1.0.0"
+	// OpenMetricsText2_0_0 uses the released OpenMetrics 2.0 format. Prometheus support
+	// is experimental and requires --enable-feature=openmetrics-2-0 before it can be
+	// listed in scrape_protocols.
+	OpenMetricsText2_0_0 ScrapeProtocol = "OpenMetricsText2.0.0"
 	UTF8NamesHeader      string         = model.EscapingKey + "=" + model.AllowUTF8
 
 	ScrapeProtocolsHeaders = map[ScrapeProtocol]string{
@@ -584,6 +589,8 @@ var (
 		PrometheusText1_0_0:  "text/plain;version=1.0.0",
 		OpenMetricsText0_0_1: "application/openmetrics-text;version=0.0.1",
 		OpenMetricsText1_0_0: "application/openmetrics-text;version=1.0.0",
+		// OpenMetricsText2_0_0 is not present by default. It is added at startup
+		// when --enable-feature=openmetrics-2-0 is set.
 	}
 
 	// DefaultScrapeProtocols is the set of scrape protocols that will be proposed
@@ -780,11 +787,13 @@ type ScrapeConfig struct {
 	// protocol are accepted by Prometheus and with what preference (most wanted is first).
 	// Supported values (case sensitive): PrometheusProto, OpenMetricsText0.0.1,
 	// OpenMetricsText1.0.0, PrometheusText1.0.0, PrometheusText0.0.4.
+	// OpenMetricsText2.0.0 is also supported but requires --enable-feature=openmetrics-2-0 (experimental implementation).
 	ScrapeProtocols []ScrapeProtocol `yaml:"scrape_protocols,omitempty"`
 	// The fallback protocol to use if the Content-Type provided by the target
 	// is not provided, blank, or not one of the expected values.
 	// Supported values (case sensitive): PrometheusProto, OpenMetricsText0.0.1,
 	// OpenMetricsText1.0.0, PrometheusText1.0.0, PrometheusText0.0.4.
+	// OpenMetricsText2.0.0 is also supported but requires --enable-feature=openmetrics-2-0 (experimental implementation).
 	ScrapeFallbackProtocol ScrapeProtocol `yaml:"fallback_scrape_protocol,omitempty"`
 	// Whether to scrape native histograms.
 	ScrapeNativeHistograms *bool `yaml:"scrape_native_histograms,omitempty"`

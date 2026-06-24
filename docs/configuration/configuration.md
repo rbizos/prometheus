@@ -63,6 +63,7 @@ global:
   # The protocols to negotiate during a scrape with the client.
   # Supported values (case sensitive): PrometheusProto, OpenMetricsText0.0.1,
   # OpenMetricsText1.0.0, PrometheusText0.0.4, PrometheusText1.0.0.
+  # OpenMetricsText2.0.0 is also supported but requires --enable-feature=openmetrics-2-0 (experimental implementation).
   # If left unset both here and in an individual scrape config, the
   # negotiation order used in that scrape config depends on the effective
   # value of scrape_native_histograms for that scrape config.
@@ -312,6 +313,16 @@ dynamically discovered using one of the supported service-discovery mechanisms.
 Additionally, `relabel_configs` allow advanced modifications to any
 target and its labels before scraping.
 
+The `scrape_protocols` field controls which exposition formats Prometheus will
+advertise and accept from targets, in priority order. See
+[content negotiation](https://prometheus.io/docs/instrumenting/content_negotiation/)
+for how the selection works. The experimental
+[OpenMetrics 2.0](https://prometheus.io/docs/specs/om/open_metrics_spec_2_0/)
+format (`OpenMetricsText2.0.0`) can be enabled via
+`--enable-feature=openmetrics-2-0`. See the
+[OpenMetrics 2.0 migration guide](https://prometheus.io/docs/guides/open_metrics_2_0_migration/)
+for the differences relative to OpenMetrics 1.0.
+
 ```yaml
 # The job name assigned to scraped metrics by default.
 job_name: <job_name>
@@ -326,6 +337,7 @@ job_name: <job_name>
 # The protocols to negotiate during a scrape with the client.
 # Supported values (case sensitive): PrometheusProto, OpenMetricsText0.0.1,
 # OpenMetricsText1.0.0, PrometheusText0.0.4, PrometheusText1.0.0.
+# OpenMetricsText2.0.0 is also supported but requires --enable-feature=openmetrics-2-0 (experimental implementation).
 # If not set in the global config, the default value depends on the 
 # setting of scrape_native_histograms. If false, it is
 # [ OpenMetricsText1.0.0, OpenMetricsText0.0.1, PrometheusText1.0.0, PrometheusText0.0.4 ].
@@ -337,6 +349,7 @@ job_name: <job_name>
 # invalid Content-Type.
 # Supported values (case sensitive): PrometheusProto, OpenMetricsText0.0.1,
 # OpenMetricsText1.0.0, PrometheusText0.0.4, PrometheusText1.0.0.
+# OpenMetricsText2.0.0 is also supported but requires --enable-feature=openmetrics-2-0 (experimental implementation).
 [ fallback_scrape_protocol: <string> ]
 
 # The HTTP resource path on which to fetch metrics from targets.

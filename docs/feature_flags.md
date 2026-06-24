@@ -303,6 +303,39 @@ These may not work well if the `<range>` is not a multiple of the collection int
 
 * If there are multiple samples being ingested at the same timestamp, only one of the points is kept - the samples are **not** summed together (this is how Prometheus works in general - duplicate timestamp samples are rejected). Any aggregation will have to be done before sending samples to Prometheus.
 
+## OpenMetrics 2.0 Scraping
+
+`--enable-feature=openmetrics-2-0`
+
+When enabled, Prometheus accepts `OpenMetricsText2.0.0` as a value in the
+`scrape_protocols` configuration field. This allows Prometheus to advertise and
+negotiate the [OpenMetrics 2.0](https://prometheus.io/docs/specs/om/open_metrics_spec_2_0/)
+text format (`application/openmetrics-text;version=2.0.0`) with scrape targets.
+See [content negotiation](https://prometheus.io/docs/instrumenting/content_negotiation/)
+for how Prometheus selects a format when scraping.
+
+The feature flag alone does not change the default scrape protocols. You must
+also explicitly add `OpenMetricsText2.0.0` to `scrape_protocols` in your global
+or per-job scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: example
+    scrape_protocols:
+      - OpenMetricsText2.0.0
+      - OpenMetricsText1.0.0
+      - PrometheusText1.0.0
+```
+
+OpenMetrics 2.0 introduces changes relative to 1.0, including native histogram
+support, gauge histograms, and revised exemplar semantics. See the
+[OpenMetrics 2.0 migration guide](https://prometheus.io/docs/guides/open_metrics_2_0_migration/)
+for a full list of changes.
+
+OpenMetrics 2.0 is a released, stable format specification. This feature flag
+covers the Prometheus implementation of scraping it, which is experimental and
+may change in future releases.
+
 ## Type and Unit Labels
 
 `--enable-feature=type-and-unit-labels`
