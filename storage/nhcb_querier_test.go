@@ -16,6 +16,9 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,6 +27,8 @@ import (
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/util/annotations"
 )
@@ -344,6 +349,318 @@ func TestNHCBAsClassicQuerier_FloatHistogram(t *testing.T) {
 	require.Equal(t, 3, count)
 }
 
+func TestNHCBAsClassicQuerier_Staleness(t *testing.T) {
+	nhcb := func(customValues ...float64) *histogram.Histogram {
+		return &histogram.Histogram{
+			Schema:          histogram.CustomBucketsSchema,
+			Count:           4,
+			Sum:             6,
+			CustomValues:    customValues,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: []int64{1, 1, -1},
+		}
+	}
+	exponential := &histogram.Histogram{
+		Count:           4,
+		Sum:             6,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+		PositiveBuckets: []int64{1, 1, -1},
+	}
+	// This is how the TSDB returns a stale marker of a histogram series.
+	staleMarker := &histogram.Histogram{Sum: math.Float64frombits(value.StaleNaN)}
+	name := func(n string) *labels.Matcher {
+		return labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, n)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		series   []Series
+		matchers []*labels.Matcher
+		expected []string
+	}{
+		{
+			name: "stale marker",
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				hSample{t: 1, h: nhcb(1, 2)}, hSample{t: 2, h: staleMarker}, hSample{t: 3, h: nhcb(1, 2)},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket")},
+			expected: []string{
+				`{__name__="foo_bucket", le="1.0"} 1@1 stale@2 1@3`,
+				`{__name__="foo_bucket", le="2.0"} 3@1 stale@2 3@3`,
+				`{__name__="foo_bucket", le="+Inf"} 4@1 stale@2 4@3`,
+			},
+		},
+		{
+			name: "float stale marker",
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				hSample{t: 1, h: nhcb(1, 2)}, fSample{t: 2, f: math.Float64frombits(value.StaleNaN)},
+			})},
+			matchers: []*labels.Matcher{name("foo_count")},
+			expected: []string{`{__name__="foo_count"} 4@1 stale@2`},
+		},
+		{
+			name: "consecutive stale markers result in a single one",
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				hSample{t: 1, h: nhcb(1, 2)}, hSample{t: 2, h: staleMarker}, hSample{t: 3, h: staleMarker}, hSample{t: 4, h: nhcb(1, 2)},
+			})},
+			matchers: []*labels.Matcher{name("foo_sum")},
+			expected: []string{`{__name__="foo_sum"} 6@1 stale@2 6@4`},
+		},
+		{
+			name: "bucket layout change",
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				hSample{t: 1, h: nhcb(1, 2)}, hSample{t: 2, h: nhcb(1, 4)},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket")},
+			expected: []string{
+				`{__name__="foo_bucket", le="1.0"} 1@1 1@2`,
+				`{__name__="foo_bucket", le="2.0"} 3@1 stale@2`,
+				`{__name__="foo_bucket", le="+Inf"} 4@1 4@2`,
+				`{__name__="foo_bucket", le="4.0"} 3@2`,
+			},
+		},
+		{
+			name: "sample that is not converted",
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				hSample{t: 1, h: nhcb(1, 2)}, hSample{t: 2, h: exponential}, hSample{t: 3, h: nhcb(1, 2)},
+			})},
+			matchers: []*labels.Matcher{name("foo_count")},
+			expected: []string{`{__name__="foo_count"} 4@1 stale@2 4@3`},
+		},
+		{
+			name: "le matcher",
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				hSample{t: 1, h: nhcb(1, 2)}, hSample{t: 2, h: staleMarker},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket"), labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "+Inf")},
+			expected: []string{`{__name__="foo_bucket", le="+Inf"} 4@1 stale@2`},
+		},
+		{
+			name: "native histogram series go stale independently",
+			series: []Series{
+				NewListSeries(labels.FromStrings("__name__", "foo", "job", "a"), []chunks.Sample{
+					hSample{t: 1, h: nhcb(1, 2)}, hSample{t: 2, h: staleMarker},
+				}),
+				NewListSeries(labels.FromStrings("__name__", "foo", "job", "b"), []chunks.Sample{
+					hSample{t: 1, h: nhcb(1, 2)}, hSample{t: 2, h: nhcb(1, 2)},
+				}),
+			},
+			matchers: []*labels.Matcher{name("foo_count")},
+			expected: []string{
+				`{__name__="foo_count", job="a"} 4@1 stale@2`,
+				`{__name__="foo_count", job="b"} 4@1 4@2`,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := NewNHCBAsClassicQuerier(&nhcbMockQuerier{nhcbSeries: tc.series})
+			ss := q.Select(context.Background(), false, nil, tc.matchers...)
+			require.ElementsMatch(t, tc.expected, samplesSummary(t, ss))
+		})
+	}
+}
+
+func TestNHCBAsClassicQuerier_Exponential(t *testing.T) {
+	// exponential returns an exponential histogram with the given schema and
+	// positive bucket counts, starting at the bucket with index offset.
+	exponential := func(schema, offset int32, buckets ...float64) *histogram.FloatHistogram {
+		fh := &histogram.FloatHistogram{
+			Schema:          schema,
+			Sum:             6,
+			PositiveSpans:   []histogram.Span{{Offset: offset, Length: uint32(len(buckets))}},
+			PositiveBuckets: buckets,
+		}
+		for _, b := range buckets {
+			fh.Count += b
+		}
+		return fh
+	}
+	nhcb := &histogram.FloatHistogram{
+		Schema:          histogram.CustomBucketsSchema,
+		Count:           4,
+		Sum:             6,
+		CustomValues:    []float64{1, 2},
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+		PositiveBuckets: []float64{1, 2, 1},
+	}
+	// This is how the TSDB returns a stale marker of a histogram series,
+	// note the exponential schema 0.
+	staleMarker := &histogram.FloatHistogram{Sum: math.Float64frombits(value.StaleNaN)}
+	name := func(n string) *labels.Matcher {
+		return labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, n)
+	}
+
+	for _, tc := range []struct {
+		name               string
+		includeExponential bool
+		series             []Series
+		matchers           []*labels.Matcher
+		expected           []string
+	}{
+		{
+			// The buckets are (0.5,1], (1,2] and (2,4].
+			name:               "exponential histogram",
+			includeExponential: true,
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				fhSample{t: 1, fh: exponential(0, 0, 1, 2, 1)},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket")},
+			expected: []string{
+				`{__name__="foo_bucket", le="0.5"} 0@1`,
+				`{__name__="foo_bucket", le="1.0"} 1@1`,
+				`{__name__="foo_bucket", le="2.0"} 3@1`,
+				`{__name__="foo_bucket", le="4.0"} 4@1`,
+				`{__name__="foo_bucket", le="+Inf"} 4@1`,
+			},
+		},
+		{
+			name:               "exponential histogram count",
+			includeExponential: true,
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				fhSample{t: 1, fh: exponential(0, 0, 1, 2, 1)},
+			})},
+			matchers: []*labels.Matcher{name("foo_count")},
+			expected: []string{`{__name__="foo_count"} 4@1`},
+		},
+		{
+			name:               "exponential histogram sum",
+			includeExponential: true,
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				fhSample{t: 1, fh: exponential(0, 0, 1, 2, 1)},
+			})},
+			matchers: []*labels.Matcher{name("foo_sum")},
+			expected: []string{`{__name__="foo_sum"} 6@1`},
+		},
+		{
+			name: "exponential histograms are not converted by default",
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				fhSample{t: 1, fh: exponential(0, 0, 1, 2, 1)},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket")},
+		},
+		{
+			// The buckets of job a are (0.5,1] and (1,2]. The ones of job b
+			// are (√2,2] and (2,2√2], which are (1,2] and (2,4] in schema 0.
+			name:               "all series are converted with the same boundaries",
+			includeExponential: true,
+			series: []Series{
+				NewListSeries(labels.FromStrings("__name__", "foo", "job", "a"), []chunks.Sample{
+					fhSample{t: 1, fh: exponential(0, 0, 1, 2)},
+				}),
+				NewListSeries(labels.FromStrings("__name__", "foo", "job", "b"), []chunks.Sample{
+					fhSample{t: 2, fh: exponential(1, 2, 1, 2)},
+				}),
+			},
+			matchers: []*labels.Matcher{name("foo_bucket")},
+			expected: []string{
+				`{__name__="foo_bucket", job="a", le="0.5"} 0@1`,
+				`{__name__="foo_bucket", job="a", le="1.0"} 1@1`,
+				`{__name__="foo_bucket", job="a", le="2.0"} 3@1`,
+				`{__name__="foo_bucket", job="a", le="4.0"} 3@1`,
+				`{__name__="foo_bucket", job="a", le="+Inf"} 3@1`,
+				`{__name__="foo_bucket", job="b", le="0.5"} 0@2`,
+				`{__name__="foo_bucket", job="b", le="1.0"} 0@2`,
+				`{__name__="foo_bucket", job="b", le="2.0"} 1@2`,
+				`{__name__="foo_bucket", job="b", le="4.0"} 3@2`,
+				`{__name__="foo_bucket", job="b", le="+Inf"} 3@2`,
+			},
+		},
+		{
+			// The buckets are (1,√2] and (√2,2] first, then (1,2]. The
+			// boundary √2 of the first sample is not used, which would mark
+			// its series stale at the second sample.
+			name:               "schema change",
+			includeExponential: true,
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				fhSample{t: 1, fh: exponential(1, 1, 1, 2)}, fhSample{t: 2, fh: exponential(0, 1, 3)},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket")},
+			expected: []string{
+				`{__name__="foo_bucket", le="1.0"} 0@1 0@2`,
+				`{__name__="foo_bucket", le="2.0"} 3@1 3@2`,
+				`{__name__="foo_bucket", le="+Inf"} 3@1 3@2`,
+			},
+		},
+		{
+			name:               "NHCB keep their own boundaries",
+			includeExponential: true,
+			series: []Series{
+				NewListSeries(labels.FromStrings("__name__", "foo", "job", "nhcb"), []chunks.Sample{
+					fhSample{t: 1, fh: nhcb},
+				}),
+				NewListSeries(labels.FromStrings("__name__", "foo", "job", "exponential"), []chunks.Sample{
+					fhSample{t: 1, fh: exponential(0, 0, 1, 2, 1)},
+				}),
+			},
+			matchers: []*labels.Matcher{name("foo_bucket")},
+			expected: []string{
+				`{__name__="foo_bucket", job="nhcb", le="1.0"} 1@1`,
+				`{__name__="foo_bucket", job="nhcb", le="2.0"} 3@1`,
+				`{__name__="foo_bucket", job="nhcb", le="+Inf"} 4@1`,
+				`{__name__="foo_bucket", job="exponential", le="0.5"} 0@1`,
+				`{__name__="foo_bucket", job="exponential", le="1.0"} 1@1`,
+				`{__name__="foo_bucket", job="exponential", le="2.0"} 3@1`,
+				`{__name__="foo_bucket", job="exponential", le="4.0"} 4@1`,
+				`{__name__="foo_bucket", job="exponential", le="+Inf"} 4@1`,
+			},
+		},
+		{
+			name:               "stale marker",
+			includeExponential: true,
+			series: []Series{NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				fhSample{t: 1, fh: exponential(0, 0, 1, 2, 1)}, fhSample{t: 2, fh: staleMarker}, fhSample{t: 3, fh: exponential(0, 0, 1, 2, 1)},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket"), labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "2.0")},
+			expected: []string{`{__name__="foo_bucket", le="2.0"} 3@1 stale@2 3@3`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &NHCBAsClassicQuerier{Querier: &nhcbMockQuerier{nhcbSeries: tc.series}, includeExponential: tc.includeExponential}
+			ss := q.Select(context.Background(), false, nil, tc.matchers...)
+			require.ElementsMatch(t, tc.expected, samplesSummary(t, ss))
+		})
+	}
+}
+
+// samplesSummary returns a string per series of ss with its labels and
+// samples, e.g. `{__name__="foo_count"} 4@1 stale@2`.
+func samplesSummary(t *testing.T, ss SeriesSet) []string {
+	t.Helper()
+
+	var (
+		summary []string
+		it      chunkenc.Iterator
+	)
+	for ss.Next() {
+		s := ss.At()
+		var sb strings.Builder
+		sb.WriteString(s.Labels().String())
+		it = s.Iterator(it)
+		for vt := it.Next(); vt != chunkenc.ValNone; vt = it.Next() {
+			var v string
+			switch vt {
+			case chunkenc.ValFloat:
+				_, f := it.At()
+				v = strconv.FormatFloat(f, 'g', -1, 64)
+				if value.IsStaleNaN(f) {
+					v = "stale"
+				}
+			case chunkenc.ValHistogram, chunkenc.ValFloatHistogram:
+				_, fh := it.AtFloatHistogram(nil)
+				v = fh.String()
+				if value.IsStaleNaN(fh.Sum) {
+					v = "stale"
+				}
+			}
+			fmt.Fprintf(&sb, " %s@%d", v, it.AtT())
+		}
+		require.NoError(t, it.Err())
+		summary = append(summary, sb.String())
+	}
+	require.NoError(t, ss.Err())
+	return summary
+}
+
 type nhcbMockQuerier struct {
 	classicSeries     []Series
 	nhcbSeries        []Series
@@ -534,6 +851,25 @@ func TestNHCBAsClassicQuerier_WarningPropagation(t *testing.T) {
 			classicSeries: []Series{},
 			nhcbSeries:    []Series{nhcbSeries},
 			nhcbWarnings:  warn,
+		})
+
+		ss := q.Select(context.Background(), false, nil,
+			labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket"))
+		for ss.Next() {
+		}
+		require.NoError(t, ss.Err())
+		require.Equal(t, warn, ss.Warnings())
+	})
+
+	t.Run("classic set warnings propagate", func(t *testing.T) {
+		warn := annotations.New().Add(errors.New("classic warning"))
+		classicSeries := []Series{NewListSeries(
+			labels.FromStrings("__name__", "http_requests_bucket", "le", "1"),
+			[]chunks.Sample{fSample{t: 1, f: 5}},
+		)}
+		q := NewNHCBAsClassicQuerier(&nhcbSetQuerier{
+			classicSet: &mockSeriesSet{idx: -1, series: classicSeries, warnings: warn},
+			nhcbSet:    NewMockSeriesSet(),
 		})
 
 		ss := q.Select(context.Background(), false, nil,
