@@ -17,6 +17,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/model/histogram"
@@ -37,8 +38,6 @@ import (
 // TODO: Support native histograms with exponential buckets, and add a flag
 // selecting the allowed conversions (lower priority).
 //
-// TODO(opt): Emit a metric counting conversions for meta-monitoring.
-//
 // TODO: Handle edge cases not yet supported (non-exhaustive, see
 // https://github.com/prometheus/prometheus/pull/19881):
 //   - Non conventional metrics:
@@ -51,10 +50,34 @@ import (
 //     https://github.com/prometheus/prometheus/pull/19886)
 //   - Stale NHCB should produce a stale marker per generated series.
 
+// NativeHistogramsAsClassicMetrics counts the classic histogram series returned
+// by selectors, by where they come from.
+type NativeHistogramsAsClassicMetrics struct {
+	fromClassic prometheus.Counter
+	fromNHCB    prometheus.Counter
+}
+
+// NewNativeHistogramsAsClassicMetrics returns new metrics, registered with reg if not nil.
+func NewNativeHistogramsAsClassicMetrics(reg prometheus.Registerer) *NativeHistogramsAsClassicMetrics {
+	series := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_engine_query_classic_histogram_series_total",
+		Help: "The total number of classic histogram series returned by selectors, by where they come from (classic or nhcb).",
+	}, []string{"from"})
+	if reg != nil {
+		reg.MustRegister(series)
+	}
+	return &NativeHistogramsAsClassicMetrics{
+		fromClassic: series.WithLabelValues("classic"),
+		fromNHCB:    series.WithLabelValues("nhcb"),
+	}
+}
+
 // NativeHistogramsAsClassicQuerier wraps a Querier and converts NHCB (Native Histogram Custom Buckets)
 // queries to classic histogram format when classic series don't exist.
 type NativeHistogramsAsClassicQuerier struct {
 	Querier
+
+	metrics *NativeHistogramsAsClassicMetrics
 }
 
 // NewNativeHistogramsAsClassicQuerier returns a new querier that wraps the given querier
@@ -73,12 +96,14 @@ func NewNativeHistogramsAsClassicQuerier(q Querier) Querier {
 // the remote read API.
 type NativeHistogramsAsClassicQueryable struct {
 	Queryable
+
+	metrics *NativeHistogramsAsClassicMetrics
 }
 
 // NewNativeHistogramsAsClassicQueryable returns a new queryable that wraps the given
-// queryable and applies NHCB-to-classic conversion to queriers.
-func NewNativeHistogramsAsClassicQueryable(q Queryable) Queryable {
-	return &NativeHistogramsAsClassicQueryable{Queryable: q}
+// queryable and applies NHCB-to-classic conversion to queriers, updating metrics if not nil.
+func NewNativeHistogramsAsClassicQueryable(q Queryable, metrics *NativeHistogramsAsClassicMetrics) Queryable {
+	return &NativeHistogramsAsClassicQueryable{Queryable: q, metrics: metrics}
 }
 
 // Querier implements the Queryable interface.
@@ -87,7 +112,7 @@ func (s *NativeHistogramsAsClassicQueryable) Querier(mint, maxt int64) (Querier,
 	if err != nil {
 		return nil, err
 	}
-	return NewNativeHistogramsAsClassicQuerier(q), nil
+	return &NativeHistogramsAsClassicQuerier{Querier: q, metrics: s.metrics}, nil
 }
 
 // Select implements the Querier interface.
@@ -103,6 +128,9 @@ func (q *NativeHistogramsAsClassicQuerier) Select(ctx context.Context, sortSerie
 	classicSet := q.Querier.Select(ctx, sortSeries, hints, matchers...)
 	if classicSet.Err() != nil {
 		return classicSet
+	}
+	if q.metrics != nil {
+		classicSet = &countingSeriesSet{SeriesSet: classicSet, counter: q.metrics.fromClassic}
 	}
 
 	// Filter in place: extractHistogramSuffix allocates baseMatchers with
@@ -129,17 +157,31 @@ func (q *NativeHistogramsAsClassicQuerier) Select(ctx context.Context, sortSerie
 		return nhcbSet
 	}
 
-	return &multipleSeriesSet{
-		seriesSet: []SeriesSet{
-			classicSet,
-			&nhcbToClassicSeriesSet{
-				nhcbSet:     nhcbSet,
-				leMatchers:  leMatchers,
-				suffix:      suffix,
-				lsetBuilder: labels.NewBuilder(labels.EmptyLabels()),
-			},
-		},
+	var convertedSet SeriesSet = &nhcbToClassicSeriesSet{
+		nhcbSet:     nhcbSet,
+		leMatchers:  leMatchers,
+		suffix:      suffix,
+		lsetBuilder: labels.NewBuilder(labels.EmptyLabels()),
 	}
+	if q.metrics != nil {
+		convertedSet = &countingSeriesSet{SeriesSet: convertedSet, counter: q.metrics.fromNHCB}
+	}
+
+	return &multipleSeriesSet{seriesSet: []SeriesSet{classicSet, convertedSet}}
+}
+
+// countingSeriesSet increments counter for each series returned by the wrapped SeriesSet.
+type countingSeriesSet struct {
+	SeriesSet
+	counter prometheus.Counter
+}
+
+func (s *countingSeriesSet) Next() bool {
+	if !s.SeriesSet.Next() {
+		return false
+	}
+	s.counter.Inc()
+	return true
 }
 
 var emptyLeMatcher = &labels.Matcher{Type: labels.MatchEqual, Name: labels.BucketLabel}
